@@ -47,6 +47,89 @@ Filter which entries to process:
   --exclude '*/admin-api/*'
 ```
 
+## Registry Mode
+
+For managing multiple documentation sources and keeping skills up-to-date, use the registry feature.
+
+### Initialize a registry
+
+```bash
+./target/release/claude-skill-gen init
+```
+
+Creates `.claude-skills-registry.toml` in the current directory with an empty sources list.
+
+### Add sources to registry
+
+```bash
+# Add a source without filters
+./target/release/claude-skill-gen add https://docs.anthropic.com/llms.txt
+
+# Add a source with filters
+./target/release/claude-skill-gen add https://docs.anthropic.com/llms.txt \
+  --include '*/api/*' \
+  --exclude '*/admin-api/*'
+
+# Add another source
+./target/release/claude-skill-gen add https://other-docs.com/llms.txt
+```
+
+### List registered sources
+
+```bash
+./target/release/claude-skill-gen list
+```
+
+Shows all sources in the registry with their filters.
+
+### Update skills from registry
+
+```bash
+# Update all sources
+./target/release/claude-skill-gen update
+
+# Update only one source
+./target/release/claude-skill-gen update --source https://docs.anthropic.com/llms.txt
+```
+
+The update command:
+1. Reads all skill directories
+2. Checks `.metadata.json` in each skill
+3. Deletes skills matching the source URL being updated
+4. Fetches fresh documentation
+5. Generates new skills
+
+This ensures you always have current documentation without manually tracking what came from where.
+
+### Registry file format
+
+`.claude-skills-registry.toml`:
+
+```toml
+[[source]]
+url = "https://docs.anthropic.com/llms.txt"
+include = ["*/api/*"]
+exclude = ["*/admin-api/*"]
+
+[[source]]
+url = "https://other-docs.com/llms.txt"
+```
+
+### Metadata tracking
+
+Each generated skill includes `.metadata.json`:
+
+```json
+{
+  "source_url": "https://docs.anthropic.com/llms.txt",
+  "entry_url": "https://docs.anthropic.com/en/api/messages.md",
+  "generated_at": "2025-01-18T10:30:00Z",
+  "generator_version": "1.0.0"
+}
+```
+
+This allows `update` to identify which skills to regenerate.
+
 ## Installing generated skills
 
 Copy the generated skills to your Claude skills directory:
@@ -69,6 +152,7 @@ git commit -m "Add skills"
 4. Generates skill directories with:
    - `SKILL.md` - Contains YAML frontmatter and skill structure
    - `reference.md` - The fetched markdown documentation
+   - `.metadata.json` - Tracking info for registry updates
 
 Skill names are automatically converted to gerund form where possible (e.g., "Get API Key" becomes "Getting API Key" with directory name `getting-api-key`).
 

@@ -45,7 +45,7 @@ struct Cli {
     command: Option<Commands>,
 
     /// URL to the llms.txt file (standalone mode, bypasses registry)
-    #[arg(global = true, required_unless_present = "command")]
+    #[arg(global = true)]
     url: Option<String>,
 
     /// Output directory for generated skills
