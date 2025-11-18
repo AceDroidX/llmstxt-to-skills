@@ -1,0 +1,19 @@
+# Rust artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Generated skills
+/skills/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
