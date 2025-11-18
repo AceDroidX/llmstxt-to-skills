@@ -4,7 +4,7 @@ Parses llms.txt files and generates Claude Skills with proper YAML frontmatter a
 
 ## What this does
 
-Takes a URL to an llms.txt file, fetches all the linked markdown documentation, and generates Claude Skills that can be loaded into Claude Code. Each entry becomes a separate skill with the fetched content as reference material.
+Takes a URL to an llms.txt file, fetches all the linked markdown documentation, and generates ONE Claude Skill per source domain. The skill includes a comprehensive SKILL.md with table of contents and a references/ directory containing all the documentation as individual markdown files. This matches the official Anthropic Agent Skills pattern.
 
 ## Building
 
@@ -93,13 +93,13 @@ Shows all sources in the registry with their filters.
 ```
 
 The update command:
-1. Reads all skill directories
-2. Checks `.metadata.json` in each skill
-3. Deletes skills matching the source URL being updated
-4. Fetches fresh documentation
-5. Generates new skills
+1. Scans the output directory for skill directories
+2. Checks `.metadata.json` in each to find matching source URLs
+3. Deletes the entire skill directory for sources being updated
+4. Fetches fresh documentation from the llms.txt source
+5. Generates a new domain skill with all current references
 
-This ensures you always have current documentation without manually tracking what came from where.
+This ensures you always have current documentation without manually tracking what came from where. Since each source generates exactly one skill directory, updates are straightforward.
 
 ### Registry file format
 
@@ -121,18 +121,20 @@ Each generated skill includes `.metadata.json`:
 
 ```json
 {
-  "source_url": "https://docs.anthropic.com/llms.txt",
-  "entry_url": "https://docs.anthropic.com/en/api/messages.md",
+  "source_url": "https://docs.claude.com/llms.txt",
+  "domain": "docs-claude-com",
+  "entry_count": 127,
+  "sections": ["Getting Started", "API Reference", "Guides", "Examples"],
   "generated_at": "2025-01-18T10:30:00Z",
   "generator_version": "1.0.0"
 }
 ```
 
-This allows `update` to identify which skills to regenerate.
+This allows `update` to identify which skills to regenerate. Since each source generates exactly one skill, the update process simply deletes the matching domain directory and regenerates it.
 
 ## Installing generated skills
 
-Copy the generated skills to your Claude skills directory:
+Copy the generated skill directories to your Claude skills directory:
 
 ```bash
 # For personal use (all projects)
@@ -141,20 +143,37 @@ cp -r ./skills/* ~/.claude/skills/
 # For project use (share with team)
 cp -r ./skills/* ./.claude/skills/
 git add .claude/skills/
-git commit -m "Add skills"
+git commit -m "Add documentation skills"
 ```
+
+Each source generates one skill directory (e.g., `docs-claude-com/`), so you can easily manage and update individual documentation sources.
 
 ## How it works
 
 1. Fetches the llms.txt file from the provided URL
-2. Parses entries using regex to extract titles, URLs, and descriptions
-3. Downloads markdown content from each linked URL
-4. Generates skill directories with:
-   - `SKILL.md` - Contains YAML frontmatter and skill structure
-   - `reference.md` - The fetched markdown documentation
-   - `.metadata.json` - Tracking info for registry updates
+2. Parses the complete structure: H1 title, blockquote summary, and H2 sections with entries
+3. Extracts domain name from URL (e.g., `docs.claude.com` → `docs-claude-com`)
+4. Downloads markdown content from each linked entry
+5. Generates a single skill directory per source:
+   - `SKILL.md` - YAML frontmatter, overview, and organized table of contents linking to all references
+   - `references/` - Directory containing one markdown file per entry
+   - `.metadata.json` - Tracking info (domain, source URL, entry count, sections) for registry updates
 
-Skill names are automatically converted to gerund form where possible (e.g., "Get API Key" becomes "Getting API Key" with directory name `getting-api-key`).
+### Example generated structure
+
+```
+skills/
+└── docs-claude-com/
+    ├── SKILL.md                    # Main skill with TOC
+    ├── .metadata.json               # Metadata for updates
+    └── references/
+        ├── getting_api_keys.md      # Each entry becomes a reference
+        ├── creating_messages.md
+        ├── streaming_responses.md
+        └── ...
+```
+
+The SKILL.md organizes all references by their original H2 sections from llms.txt, making it easy for Claude to navigate the documentation.
 
 ## llms.txt format
 

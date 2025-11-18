@@ -17,3 +17,7 @@ Cargo.lock
 # Temporary files
 *.tmp
 *.bak
+
+
+# Local skills registry
+.claude-skills-registry.toml

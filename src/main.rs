@@ -32,7 +32,9 @@ struct Source {
 #[derive(Debug, Serialize, Deserialize)]
 struct SkillMetadata {
     source_url: String,
-    entry_url: String,
+    domain: String,
+    entry_count: usize,
+    sections: Vec<String>,
     generated_at: DateTime<Utc>,
     generator_version: String,
 }
@@ -110,22 +112,31 @@ struct LlmsTxtEntry {
     title: String,
     url: String,
     description: String,
+    section: String,
 }
 
 impl LlmsTxtEntry {
-    fn new(title: String, url: String, description: Option<String>) -> Self {
+    fn new(title: String, url: String, description: Option<String>, section: String) -> Self {
         Self {
             title,
             url,
             description: description.unwrap_or_default(),
+            section,
         }
     }
+}
+
+/// Represents a complete parsed llms.txt file with title, summary, and organized sections
+#[derive(Debug, Clone)]
+struct ParsedLlmsTxt {
+    title: Option<String>,
+    summary: Option<String>,
+    sections: Vec<(String, Vec<LlmsTxtEntry>)>,
 }
 
 /// Generates Claude Skills from llms.txt entries
 struct SkillGenerator {
     output_dir: PathBuf,
-    verb_conversions: HashMap<&'static str, &'static str>,
     client: reqwest::Client,
 }
 
@@ -134,119 +145,72 @@ impl SkillGenerator {
         std::fs::create_dir_all(&output_dir)
             .context(format!("Failed to create output directory: {:?}", output_dir))?;
 
-        let mut verb_conversions = HashMap::new();
-        verb_conversions.insert("get", "getting");
-        verb_conversions.insert("list", "listing");
-        verb_conversions.insert("create", "creating");
-        verb_conversions.insert("update", "updating");
-        verb_conversions.insert("delete", "deleting");
-        verb_conversions.insert("remove", "removing");
-        verb_conversions.insert("add", "adding");
-        verb_conversions.insert("cancel", "canceling");
-        verb_conversions.insert("archive", "archiving");
-        verb_conversions.insert("retrieve", "retrieving");
-        verb_conversions.insert("send", "sending");
-        verb_conversions.insert("download", "downloading");
-        verb_conversions.insert("upload", "uploading");
-        verb_conversions.insert("count", "counting");
-        verb_conversions.insert("generate", "generating");
-        verb_conversions.insert("improve", "improving");
-        verb_conversions.insert("build", "building");
-        verb_conversions.insert("migrate", "migrating");
-        verb_conversions.insert("implement", "implementing");
-        verb_conversions.insert("optimize", "optimizing");
-        verb_conversions.insert("configure", "configuring");
-        verb_conversions.insert("install", "installing");
-        verb_conversions.insert("deploy", "deploying");
-
         Ok(Self {
             output_dir,
-            verb_conversions,
             client,
         })
     }
 
-    /// Convert a title to gerund form (e.g., 'Get API Key' -> 'Getting API Keys')
-    fn title_to_gerund(&self, title: &str) -> String {
-        let words: Vec<&str> = title.split_whitespace().collect();
+    /// Generate a domain-level Claude Skill from parsed llms.txt content
+    async fn generate_domain_skill(
+        &self,
+        parsed: &ParsedLlmsTxt,
+        source_url: &str,
+        domain: &str,
+    ) -> Result<PathBuf> {
+        let skill_dir = self.output_dir.join(domain);
+        let references_dir = skill_dir.join("references");
 
-        if words.is_empty() {
-            return title.to_string();
-        }
+        // Create skill and references directories
+        std::fs::create_dir_all(&references_dir)
+            .context(format!("Failed to create references directory: {:?}", references_dir))?;
 
-        let mut result = Vec::new();
-        let first_word = words[0].to_lowercase();
+        // Count total entries across all sections
+        let total_entries: usize = parsed.sections.iter().map(|(_, entries)| entries.len()).sum();
 
-        if let Some(&gerund) = self.verb_conversions.get(first_word.as_str()) {
-            result.push(capitalize_first(gerund));
+        // Generate description (200-1024 chars) from title, summary, and sections
+        let skill_title = parsed
+            .title
+            .as_ref()
+            .unwrap_or(&domain.to_string())
+            .clone();
+
+        let mut description = if let Some(summary) = &parsed.summary {
+            format!("{}.", summary.trim_end_matches('.'))
         } else {
-            result.push(capitalize_first(&first_word));
-        }
-
-        for word in &words[1..] {
-            result.push(capitalize_first(&word.to_lowercase()));
-        }
-
-        result.join(" ")
-    }
-
-    /// Convert a title to a skill directory name (hyphenated, lowercase)
-    fn title_to_skill_name(&self, title: &str) -> String {
-        let gerund_title = self.title_to_gerund(title);
-        let lowercase = gerund_title.to_lowercase();
-        let re = Regex::new(r"[^\w\s-]").unwrap();
-        let name = re.replace_all(&lowercase, "");
-        let re_spaces = Regex::new(r"[-\s]+").unwrap();
-        let name = re_spaces.replace_all(&name, "-");
-        name.trim_matches('-').to_string()
-    }
-
-    /// Create a proper skill description (200-1024 chars, third-person)
-    fn create_description(&self, entry: &LlmsTxtEntry) -> String {
-        let mut base_desc = if !entry.description.is_empty() {
-            entry.description.clone()
-        } else {
-            format!("Provides guidance and information about {}.", entry.title.to_lowercase())
+            format!("Documentation and reference materials for {}.", skill_title)
         };
 
-        if !base_desc.ends_with('.') {
-            base_desc.push('.');
+        // Add section overview
+        if !parsed.sections.is_empty() {
+            let section_names: Vec<String> = parsed
+                .sections
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            description.push_str(&format!(
+                " Contains {} reference documents organized into sections: {}.",
+                total_entries,
+                section_names.join(", ")
+            ));
         }
 
-        let usage_context = format!(
-            " Use when working with {} or when user mentions {}.",
-            entry.title.to_lowercase(),
-            entry.title.to_lowercase()
-        );
-
-        let mut full_desc = format!("{}{}", base_desc, usage_context);
-
-        // Pad if too short
-        while full_desc.len() < 200 {
-            full_desc.push_str(&format!(
-                " This skill includes comprehensive documentation and examples for {}.",
-                entry.title.to_lowercase()
+        // Ensure description is at least 200 chars
+        while description.len() < 200 {
+            description.push_str(&format!(
+                " Use this skill when working with {} documentation or when the user mentions topics covered in these references.",
+                skill_title
             ));
         }
 
         // Truncate if too long
-        if full_desc.len() > 1024 {
-            full_desc.truncate(1021);
-            full_desc.push_str("...");
+        if description.len() > 1024 {
+            description.truncate(1021);
+            description.push_str("...");
         }
 
-        full_desc
-    }
-
-    /// Create SKILL.md content with proper frontmatter
-    fn create_skill_md(
-        &self,
-        title: &str,
-        description: &str,
-        entry: &LlmsTxtEntry,
-        has_reference: bool,
-    ) -> String {
-        let mut content = format!(
+        // Generate comprehensive SKILL.md
+        let mut skill_md = format!(
             r#"---
 name: {}
 description: {}
@@ -255,129 +219,139 @@ version: 1.0.0
 
 # {}
 
-This skill provides guidance and information about {}.
-
-## Quick Start
-
-This skill contains documentation extracted from the official source. "#,
-            title,
-            description,
-            title,
-            entry.title.to_lowercase()
+"#,
+            domain, description, skill_title
         );
 
-        if has_reference {
-            let overview = if !entry.description.is_empty() {
-                entry.description.clone()
-            } else {
-                format!("Comprehensive information about {}.", entry.title.to_lowercase())
-            };
-
-            content.push_str(&format!(
-                r#"For complete details, see [reference.md](reference.md).
-
-## Overview
+        // Add overview from summary
+        if let Some(summary) = &parsed.summary {
+            skill_md.push_str(&format!(
+                r#"## Overview
 
 {}
 
-## How to Use
-
-When you need information about {}:
-1. Ask Claude about the specific aspect you need help with
-2. Claude will reference the documentation in this skill
-3. Follow the guidance provided in the reference documentation
-
-## Reference Documentation
-
-Complete documentation is available in [reference.md](reference.md), which includes:
-- Detailed explanations and specifications
-- Code examples and usage patterns
-- API references and parameters
-- Best practices and recommendations
-
-## Examples
-
-See [reference.md](reference.md) for comprehensive examples and use cases.
 "#,
-                overview,
-                entry.title.to_lowercase()
-            ));
-        } else {
-            let overview = if !entry.description.is_empty() {
-                entry.description.clone()
-            } else {
-                format!("Information about {}.", entry.title.to_lowercase())
-            };
-
-            content.push_str(&format!(
-                r#"
-
-## Overview
-
-{}
-
-## How to Use
-
-When you need information about {}:
-1. Ask Claude about the specific aspect you need help with
-2. Claude will provide guidance based on this skill's knowledge
-
-## Reference
-
-Original documentation: {}
-"#,
-                overview,
-                entry.title.to_lowercase(),
-                entry.url
+                summary
             ));
         }
 
-        content
-    }
+        // Add usage instructions
+        skill_md.push_str(&format!(
+            r#"## How to Use This Skill
 
-    /// Generate a Claude Skill from an llms.txt entry
-    async fn generate_skill(&self, entry: &LlmsTxtEntry, source_url: &str) -> Result<PathBuf> {
-        let skill_name = self.title_to_skill_name(&entry.title);
-        let skill_dir = self.output_dir.join(&skill_name);
+This skill contains {} reference documents organized by topic. When you need information about {}:
 
-        std::fs::create_dir_all(&skill_dir)
-            .context(format!("Failed to create skill directory: {:?}", skill_dir))?;
+1. Claude will automatically access relevant reference files based on your question
+2. Reference files are organized in the `references/` directory by topic
+3. Each reference contains detailed documentation extracted from the official source
 
-        // Fetch markdown content
-        println!("  Fetching content from {}...", entry.url);
-        let markdown_content = fetch_markdown_content(&self.client, &entry.url).await;
+"#,
+            total_entries, skill_title
+        ));
 
-        // Generate SKILL.md
-        let gerund_title = self.title_to_gerund(&entry.title);
-        let description = self.create_description(entry);
-        let has_reference = markdown_content.is_some();
+        // Generate table of contents organized by section
+        skill_md.push_str("## Reference Documentation\n\n");
 
-        let skill_md = self.create_skill_md(&gerund_title, &description, entry, has_reference);
+        for (section_name, entries) in &parsed.sections {
+            skill_md.push_str(&format!("### {}\n\n", section_name));
 
+            for entry in entries {
+                let filename = entry_title_to_filename(&entry.title);
+                let description_text = if !entry.description.is_empty() {
+                    format!(" - {}", entry.description)
+                } else {
+                    String::new()
+                };
+                skill_md.push_str(&format!(
+                    "- [{}](references/{}){}\n",
+                    entry.title, filename, description_text
+                ));
+            }
+
+            skill_md.push_str("\n");
+        }
+
+        // Write SKILL.md
         let skill_md_path = skill_dir.join("SKILL.md");
         std::fs::write(&skill_md_path, skill_md)
             .context(format!("Failed to write SKILL.md: {:?}", skill_md_path))?;
 
-        // Generate reference.md if we have content
-        if let Some(content) = markdown_content {
-            let reference_path = skill_dir.join("reference.md");
-            if let Err(e) = std::fs::write(&reference_path, content) {
-                println!("  Warning: Failed to write reference.md: {}", e);
+        println!("  Created SKILL.md");
+
+        // Generate reference files for each entry
+        let mut entry_count = 0;
+        for (section_name, entries) in &parsed.sections {
+            println!("\n  Processing section: {}", section_name);
+
+            for entry in entries {
+                let filename = entry_title_to_filename(&entry.title);
+                let reference_path = references_dir.join(&filename);
+
+                println!("    Fetching: {} -> {}", entry.title, filename);
+
+                // Fetch content
+                match fetch_markdown_content(&self.client, &entry.url).await {
+                    Some(content) => {
+                        // Create reference file with frontmatter
+                        let mut reference_content = format!(
+                            r#"# {}
+
+**Source:** {}
+**Section:** {}
+
+"#,
+                            entry.title, entry.url, section_name
+                        );
+
+                        if !entry.description.is_empty() {
+                            reference_content.push_str(&format!(
+                                "**Description:** {}\n\n---\n\n",
+                                entry.description
+                            ));
+                        } else {
+                            reference_content.push_str("---\n\n");
+                        }
+
+                        reference_content.push_str(&content);
+
+                        std::fs::write(&reference_path, reference_content).context(format!(
+                            "Failed to write reference file: {:?}",
+                            reference_path
+                        ))?;
+
+                        entry_count += 1;
+                        println!("      ✓ Saved");
+                    }
+                    None => {
+                        println!("      ✗ Failed to fetch content");
+                    }
+                }
             }
         }
+
+        // Collect all section names
+        let section_names: Vec<String> = parsed
+            .sections
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
 
         // Write metadata
         let metadata = SkillMetadata {
             source_url: source_url.to_string(),
-            entry_url: entry.url.clone(),
+            domain: domain.to_string(),
+            entry_count,
+            sections: section_names,
             generated_at: Utc::now(),
             generator_version: VERSION.to_string(),
         };
         let metadata_path = skill_dir.join(".metadata.json");
-        let metadata_json = serde_json::to_string_pretty(&metadata)
-            .context("Failed to serialize metadata")?;
+        let metadata_json =
+            serde_json::to_string_pretty(&metadata).context("Failed to serialize metadata")?;
         std::fs::write(&metadata_path, metadata_json)
             .context(format!("Failed to write metadata: {:?}", metadata_path))?;
+
+        println!("\n  ✓ Skill complete: {} references in {} sections", entry_count, parsed.sections.len());
 
         Ok(skill_dir)
     }
@@ -399,18 +373,65 @@ async fn fetch_llms_txt(client: &reqwest::Client, url: &str) -> Result<String> {
     Ok(content)
 }
 
-/// Parse llms.txt content and extract entries
-fn parse_llms_txt(content: &str, base_url: &str) -> Result<Vec<LlmsTxtEntry>> {
-    let re = Regex::new(r"^-\s+\[([^\]]+)\]\(([^\)]+)\)(?::\s+(.*))?$")
-        .context("Failed to compile regex")?;
+/// Parse llms.txt content and extract title, summary, and organized sections
+fn parse_llms_txt(content: &str, base_url: &str) -> Result<ParsedLlmsTxt> {
+    let h1_re = Regex::new(r"^# (.+)$").context("Failed to compile H1 regex")?;
+    let h2_re = Regex::new(r"^## (.+)$").context("Failed to compile H2 regex")?;
+    let entry_re = Regex::new(r"^-\s+\[([^\]]+)\]\(([^\)]+)\)(?::\s+(.*))?$")
+        .context("Failed to compile entry regex")?;
 
     let base = Url::parse(base_url).context("Invalid base URL")?;
-    let mut entries = Vec::new();
+
+    let mut title: Option<String> = None;
+    let mut summary_lines: Vec<String> = Vec::new();
+    let mut sections: Vec<(String, Vec<LlmsTxtEntry>)> = Vec::new();
+    let mut current_section: Option<String> = None;
+    let mut current_entries: Vec<LlmsTxtEntry> = Vec::new();
+    let mut in_blockquote = false;
 
     for line in content.lines() {
-        let line = line.trim();
-        if let Some(caps) = re.captures(line) {
-            let title = caps.get(1).unwrap().as_str().to_string();
+        let trimmed = line.trim();
+
+        // Extract H1 title
+        if let Some(caps) = h1_re.captures(trimmed) {
+            if title.is_none() {
+                title = Some(caps.get(1).unwrap().as_str().to_string());
+            }
+            continue;
+        }
+
+        // Extract blockquote summary (consecutive lines starting with >)
+        if trimmed.starts_with('>') {
+            in_blockquote = true;
+            let summary_line = trimmed.trim_start_matches('>').trim().to_string();
+            if !summary_line.is_empty() {
+                summary_lines.push(summary_line);
+            }
+            continue;
+        } else if in_blockquote && !trimmed.is_empty() && !trimmed.starts_with('#') {
+            // Continue blockquote if next line is not empty and not a header
+            continue;
+        } else {
+            in_blockquote = false;
+        }
+
+        // Track H2 sections
+        if let Some(caps) = h2_re.captures(trimmed) {
+            // Save previous section if it exists
+            if let Some(section_name) = current_section.take() {
+                if !current_entries.is_empty() {
+                    sections.push((section_name, current_entries.clone()));
+                    current_entries.clear();
+                }
+            }
+            // Start new section
+            current_section = Some(caps.get(1).unwrap().as_str().to_string());
+            continue;
+        }
+
+        // Parse entries
+        if let Some(caps) = entry_re.captures(trimmed) {
+            let entry_title = caps.get(1).unwrap().as_str().to_string();
             let url_str = caps.get(2).unwrap().as_str();
             let description = caps.get(3).map(|m| m.as_str().to_string());
 
@@ -423,11 +444,32 @@ fn parse_llms_txt(content: &str, base_url: &str) -> Result<Vec<LlmsTxtEntry>> {
                     .to_string()
             };
 
-            entries.push(LlmsTxtEntry::new(title, url, description));
+            let section_name = current_section.clone().unwrap_or_else(|| "General".to_string());
+            current_entries.push(LlmsTxtEntry::new(entry_title, url, description, section_name));
         }
     }
 
-    Ok(entries)
+    // Save final section
+    if let Some(section_name) = current_section {
+        if !current_entries.is_empty() {
+            sections.push((section_name, current_entries));
+        }
+    } else if !current_entries.is_empty() {
+        // Handle entries without sections
+        sections.push(("General".to_string(), current_entries));
+    }
+
+    let summary = if summary_lines.is_empty() {
+        None
+    } else {
+        Some(summary_lines.join(" "))
+    };
+
+    Ok(ParsedLlmsTxt {
+        title,
+        summary,
+        sections,
+    })
 }
 
 /// Fetch markdown content from a URL
@@ -486,13 +528,40 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     builder.build().context("Failed to build GlobSet")
 }
 
-/// Capitalize the first character of a string
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-    }
+/// Extract domain name from source URL and sanitize for filesystem use
+fn extract_domain_name(source_url: &str) -> Result<String> {
+    let url = Url::parse(source_url)
+        .context(format!("Failed to parse source URL: {}", source_url))?;
+
+    let domain = url.host_str()
+        .context("No host in URL")?;
+
+    // Sanitize for filesystem: replace dots with hyphens, lowercase, remove invalid chars
+    let sanitized = domain
+        .to_lowercase()
+        .replace('.', "-");
+
+    // Remove any remaining invalid filesystem characters
+    let re = Regex::new(r"[^\w\-]").unwrap();
+    let clean = re.replace_all(&sanitized, "");
+
+    Ok(clean.to_string())
+}
+
+/// Convert entry title to filesystem-safe filename for reference files
+fn entry_title_to_filename(title: &str) -> String {
+    // Convert to lowercase and replace spaces/hyphens with underscores
+    let lowercase = title.to_lowercase();
+    let with_underscores = lowercase.replace(' ', "_").replace('-', "_");
+
+    // Remove special characters, keep only word chars and underscores
+    let re = Regex::new(r"[^\w_]").unwrap();
+    let clean = re.replace_all(&with_underscores, "");
+
+    // Trim leading/trailing underscores and add .md extension
+    let trimmed = clean.trim_matches('_');
+
+    format!("{}.md", trimmed)
 }
 
 /// Get the registry file path (current directory or custom path)
@@ -525,7 +594,7 @@ fn read_metadata(skill_dir: &PathBuf) -> Option<SkillMetadata> {
     serde_json::from_str(&content).ok()
 }
 
-/// Generate skills from a source (used by both standalone and update modes)
+/// Generate domain skill from a source (used by both standalone and update modes)
 async fn generate_from_source(
     client: &reqwest::Client,
     source_url: &str,
@@ -537,48 +606,61 @@ async fn generate_from_source(
     println!("Fetching llms.txt from {}...", source_url);
     let llms_txt_content = fetch_llms_txt(client, source_url).await?;
 
-    // Parse entries
-    println!("Parsing entries...");
-    let entries = parse_llms_txt(&llms_txt_content, source_url)?;
-    println!("Found {} entries", entries.len());
+    // Parse llms.txt
+    println!("Parsing llms.txt...");
+    let mut parsed = parse_llms_txt(&llms_txt_content, source_url)?;
 
-    // Apply filters
-    let entries = if !include.is_empty() || !exclude.is_empty() {
-        let filtered = apply_filters(entries, include, exclude)?;
-        println!("After filtering: {} entries", filtered.len());
-        filtered
-    } else {
-        entries
-    };
+    // Count total entries
+    let total_entries: usize = parsed.sections.iter().map(|(_, entries)| entries.len()).sum();
+    println!(
+        "Found {} entries in {} sections",
+        total_entries,
+        parsed.sections.len()
+    );
 
-    if entries.is_empty() {
-        println!("No entries to process after filtering");
-        return Ok((0, 0));
-    }
+    // Apply filters if specified
+    if !include.is_empty() || !exclude.is_empty() {
+        println!("Applying filters...");
 
-    // Generate skills
-    println!("\nGenerating skills in {:?}...", output_dir);
-    let generator = SkillGenerator::new(output_dir.clone(), client.clone())?;
+        // Flatten, filter, and reconstruct sections
+        let mut filtered_sections: Vec<(String, Vec<LlmsTxtEntry>)> = Vec::new();
 
-    let mut success_count = 0;
-    let mut failed_count = 0;
+        for (section_name, entries) in parsed.sections {
+            let filtered_entries = apply_filters(entries, include, exclude)?;
 
-    for (i, entry) in entries.iter().enumerate() {
-        println!("\n[{}/{}] Processing: {}", i + 1, entries.len(), entry.title);
-
-        match generator.generate_skill(entry, source_url).await {
-            Ok(path) => {
-                println!("  ✓ Created skill: {}", path.display());
-                success_count += 1;
+            if !filtered_entries.is_empty() {
+                filtered_sections.push((section_name, filtered_entries));
             }
-            Err(e) => {
-                println!("  ✗ Failed: {}", e);
-                failed_count += 1;
-            }
+        }
+
+        parsed.sections = filtered_sections;
+
+        let filtered_count: usize = parsed.sections.iter().map(|(_, entries)| entries.len()).sum();
+        println!("After filtering: {} entries in {} sections", filtered_count, parsed.sections.len());
+
+        if filtered_count == 0 {
+            println!("No entries remaining after filtering");
+            return Ok((0, 1));
         }
     }
 
-    Ok((success_count, failed_count))
+    // Extract domain name
+    let domain = extract_domain_name(source_url)?;
+    println!("\nGenerating skill: {}", domain);
+
+    // Generate domain skill
+    let generator = SkillGenerator::new(output_dir.clone(), client.clone())?;
+
+    match generator.generate_domain_skill(&parsed, source_url, &domain).await {
+        Ok(skill_dir) => {
+            println!("\n✓ Successfully generated domain skill: {}", skill_dir.display());
+            Ok((1, 0))
+        }
+        Err(e) => {
+            println!("\n✗ Failed to generate skill: {}", e);
+            Ok((0, 1))
+        }
+    }
 }
 
 #[tokio::main]
