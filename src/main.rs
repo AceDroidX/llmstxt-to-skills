@@ -22,6 +22,8 @@ struct RegistryConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Source {
     url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     #[serde(default)]
     include: Vec<String>,
     #[serde(default)]
@@ -53,6 +55,10 @@ struct Cli {
     /// Output directory for generated skills
     #[arg(short, long, default_value = "./skills", global = true)]
     output_dir: PathBuf,
+
+    /// Skill folder and SKILL.md name (defaults to the source domain)
+    #[arg(long, global = true, value_parser = validate_skill_name)]
+    name: Option<String>,
 
     /// Include only URLs matching this pattern (can be specified multiple times)
     #[arg(long, global = true)]
@@ -157,8 +163,10 @@ impl SkillGenerator {
         parsed: &ParsedLlmsTxt,
         source_url: &str,
         domain: &str,
+        skill_name: &str,
     ) -> Result<PathBuf> {
-        let skill_dir = self.output_dir.join(domain);
+        let skill_dir = self.output_dir.join(skill_name);
+        ensure_destination_available(&skill_dir, source_url)?;
         let references_dir = skill_dir.join("references");
 
         // Create skill and references directories
@@ -220,7 +228,7 @@ version: 1.0.0
 # {}
 
 "#,
-            domain, description, skill_title
+            skill_name, description, skill_title
         );
 
         // Add overview from summary
@@ -548,6 +556,95 @@ fn extract_domain_name(source_url: &str) -> Result<String> {
     Ok(clean.to_string())
 }
 
+/// Keep custom names safe as a single directory and a plain YAML value.
+fn validate_skill_name(name: &str) -> std::result::Result<String, String> {
+    let valid = !name.is_empty()
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if valid {
+        Ok(name.to_string())
+    } else {
+        Err("name must use lowercase letters, digits, and single hyphens between them".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_name_is_parsed_and_validated() {
+        let cli = Cli::try_parse_from([
+            "claude-skill-gen",
+            "https://example.com/llms.txt",
+            "--name",
+            "my-docs",
+        ])
+        .unwrap();
+        assert_eq!(cli.name.as_deref(), Some("my-docs"));
+
+        for invalid in ["../other", "My Docs", "my_docs", "-docs", "docs-"] {
+            assert!(validate_skill_name(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn registry_name_is_optional_and_persisted() {
+        let legacy: RegistryConfig = toml::from_str("[[source]]\nurl = 'https://example.com/llms.txt'\n")
+            .unwrap();
+        assert!(legacy.sources[0].name.is_none());
+
+        let source = Source {
+            url: "https://example.com/llms.txt".to_string(),
+            name: Some("my-docs".to_string()),
+            include: vec![],
+            exclude: vec![],
+        };
+        let content = toml::to_string(&RegistryConfig {
+            sources: vec![source],
+        })
+        .unwrap();
+        let saved: RegistryConfig = toml::from_str(&content).unwrap();
+        assert_eq!(saved.sources[0].name.as_deref(), Some("my-docs"));
+    }
+
+    #[tokio::test]
+    async fn custom_name_sets_folder_and_frontmatter() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "claude-skill-gen-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let client = reqwest::Client::new();
+        let generator = SkillGenerator::new(output_dir.clone(), client).unwrap();
+        let parsed = ParsedLlmsTxt {
+            title: Some("Example Docs".to_string()),
+            summary: None,
+            sections: vec![],
+        };
+
+        let skill_dir = generator
+            .generate_domain_skill(
+                &parsed,
+                "https://example.com/llms.txt",
+                "example-com",
+                "my-docs",
+            )
+            .await
+            .unwrap();
+        assert_eq!(skill_dir, output_dir.join("my-docs"));
+        let skill_md = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(skill_md.starts_with("---\nname: my-docs\n"));
+        let metadata = read_metadata(&skill_dir).unwrap();
+        assert_eq!(metadata.domain, "example-com");
+        std::fs::remove_dir_all(output_dir).unwrap();
+    }
+}
+
 /// Convert entry title to filesystem-safe filename for reference files
 fn entry_title_to_filename(title: &str) -> String {
     // Convert to lowercase and replace spaces/hyphens with underscores
@@ -575,6 +672,12 @@ fn load_registry(path: &PathBuf) -> Result<RegistryConfig> {
         .context(format!("Failed to read registry file: {:?}", path))?;
     let config: RegistryConfig = toml::from_str(&content)
         .context("Failed to parse registry TOML")?;
+    for source in &config.sources {
+        if let Some(name) = &source.name {
+            validate_skill_name(name)
+                .map_err(|error| anyhow::anyhow!("Invalid name for {}: {}", source.url, error))?;
+        }
+    }
     Ok(config)
 }
 
@@ -594,11 +697,26 @@ fn read_metadata(skill_dir: &PathBuf) -> Option<SkillMetadata> {
     serde_json::from_str(&content).ok()
 }
 
+fn ensure_destination_available(skill_dir: &PathBuf, source_url: &str) -> Result<()> {
+    if skill_dir.exists()
+        && read_metadata(skill_dir)
+            .map(|metadata| metadata.source_url != source_url)
+            .unwrap_or(true)
+    {
+        anyhow::bail!(
+            "Skill directory {} already exists for another source",
+            skill_dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Generate domain skill from a source (used by both standalone and update modes)
 async fn generate_from_source(
     client: &reqwest::Client,
     source_url: &str,
     output_dir: &PathBuf,
+    name: Option<&str>,
     include: &[String],
     exclude: &[String],
 ) -> Result<(usize, usize)> {
@@ -646,12 +764,13 @@ async fn generate_from_source(
 
     // Extract domain name
     let domain = extract_domain_name(source_url)?;
-    println!("\nGenerating skill: {}", domain);
+    let skill_name = name.unwrap_or(&domain);
+    println!("\nGenerating skill: {}", skill_name);
 
     // Generate domain skill
     let generator = SkillGenerator::new(output_dir.clone(), client.clone())?;
 
-    match generator.generate_domain_skill(&parsed, source_url, &domain).await {
+    match generator.generate_domain_skill(&parsed, source_url, &domain, skill_name).await {
         Ok(skill_dir) => {
             println!("\n✓ Successfully generated domain skill: {}", skill_dir.display());
             Ok((1, 0))
@@ -707,12 +826,16 @@ async fn main() -> Result<()> {
             // Add new source
             config.sources.push(Source {
                 url: url.clone(),
+                name: cli.name.clone(),
                 include: include.clone(),
                 exclude: exclude.clone(),
             });
 
             save_registry(&registry_path, &config)?;
             println!("Added source to registry: {}", url);
+            if let Some(name) = &cli.name {
+                println!("  Name: {}", name);
+            }
             if !include.is_empty() {
                 println!("  Include: {:?}", include);
             }
@@ -738,6 +861,9 @@ async fn main() -> Result<()> {
             println!("Registry sources ({}):", registry_path.display());
             for (i, source) in config.sources.iter().enumerate() {
                 println!("\n{}. {}", i + 1, source.url);
+                if let Some(name) = &source.name {
+                    println!("   Name: {}", name);
+                }
                 if !source.include.is_empty() {
                     println!("   Include: {:?}", source.include);
                 }
@@ -771,6 +897,10 @@ async fn main() -> Result<()> {
                 anyhow::bail!("No matching sources found");
             }
 
+            if cli.name.is_some() && sources_to_update.len() != 1 {
+                anyhow::bail!("--name requires updating exactly one source; use --source to select it");
+            }
+
             let mut total_success = 0;
             let mut total_failed = 0;
 
@@ -778,6 +908,11 @@ async fn main() -> Result<()> {
                 println!("\n{}", "=".repeat(60));
                 println!("Updating from: {}", src.url);
                 println!("{}", "=".repeat(60));
+
+                let domain = extract_domain_name(&src.url)?;
+                let skill_name = cli.name.as_deref().or(src.name.as_deref()).unwrap_or(&domain);
+                let target_dir = cli.output_dir.join(skill_name);
+                ensure_destination_available(&target_dir, &src.url)?;
 
                 // Delete existing skills from this source
                 if cli.output_dir.exists() {
@@ -799,6 +934,7 @@ async fn main() -> Result<()> {
                     &client,
                     &src.url,
                     &cli.output_dir,
+                    cli.name.as_deref().or(src.name.as_deref()),
                     &src.include,
                     &src.exclude,
                 ).await?;
@@ -829,6 +965,7 @@ async fn main() -> Result<()> {
                     &client,
                     url,
                     &cli.output_dir,
+                    cli.name.as_deref(),
                     &cli.include,
                     &cli.exclude,
                 ).await?;

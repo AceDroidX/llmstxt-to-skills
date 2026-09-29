@@ -26,6 +26,14 @@ Basic usage:
 
 This creates skills in `./skills/` by default.
 
+Set the generated folder name and the `name` in `SKILL.md`:
+
+```bash
+./target/release/claude-skill-gen https://docs.anthropic.com/llms.txt --name anthropic-docs
+```
+
+Names use lowercase letters, digits, and hyphens. Without `--name`, the source domain determines the name.
+
 Custom output directory:
 
 ```bash
@@ -72,6 +80,9 @@ Creates `.claude-skills-registry.toml` in the current directory with an empty so
 
 # Add another source
 ./target/release/claude-skill-gen add https://other-docs.com/llms.txt
+
+# Save a custom name for future updates
+./target/release/claude-skill-gen add https://docs.example.com/llms.txt --name example-docs
 ```
 
 ### List registered sources
@@ -90,7 +101,12 @@ Shows all sources in the registry with their filters.
 
 # Update only one source
 ./target/release/claude-skill-gen update --source https://docs.anthropic.com/llms.txt
+
+# Override the saved name while updating one source
+./target/release/claude-skill-gen update --source https://docs.example.com/llms.txt --name new-example-docs
 ```
+
+An update uses the name saved with the source unless `--name` overrides it. An override applies to only one source.
 
 The update command:
 1. Scans the output directory for skill directories
@@ -113,6 +129,7 @@ exclude = ["*/admin-api/*"]
 
 [[source]]
 url = "https://other-docs.com/llms.txt"
+name = "other-docs"
 ```
 
 ### Metadata tracking
